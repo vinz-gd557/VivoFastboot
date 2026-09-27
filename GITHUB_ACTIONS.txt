@@ -1,0 +1,14 @@
+GitHub Actions
+==============
+
+1. Create a GitHub repository.
+2. Upload/push this whole VivoFastboot folder.
+3. Open the repository's Actions tab.
+4. Select "Build VivoFastboot APK".
+5. Push to main/master, open a pull request, or use Run workflow manually.
+6. After the run finishes, download the APK from the Artifacts section:
+   - VivoFastboot-debug
+   - VivoFastboot-release
+
+The workflow uses JDK 17 and Gradle 8.11.1.
+No Gradle wrapper is required because GitHub Actions installs the specified Gradle version.

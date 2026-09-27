@@ -1,0 +1,8 @@
+mkdir -p VivoFastboot
+cd VivoFastboot
+# copy the files from this project, then:
+git init
+git add .
+git commit -m "Initial VivoFastboot Android USB fastboot app"
+# Add your GitHub remote here, then:
+# git push -u origin main

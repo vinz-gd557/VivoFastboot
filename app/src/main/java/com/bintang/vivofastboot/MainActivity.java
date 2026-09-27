@@ -1,0 +1,666 @@
+package com.bintang.vivofastboot;
+
+import android.app.Activity;
+import android.app.AlertDialog;
+import android.app.PendingIntent;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.hardware.usb.UsbConstants;
+import android.hardware.usb.UsbDevice;
+import android.hardware.usb.UsbDeviceConnection;
+import android.hardware.usb.UsbInterface;
+import android.hardware.usb.UsbManager;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.provider.Settings;
+import android.view.Gravity;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.ArrayAdapter;
+import android.widget.Button;
+import android.widget.CheckBox;
+import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.Spinner;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+
+public class MainActivity extends Activity {
+    private static final String ACTION_USB_PERMISSION = "com.bintang.vivofastboot.USB_PERMISSION";
+    private static final int PICK_FILE = 42;
+
+    private UsbManager usbManager;
+    private final ArrayList<UsbDevice> usbDevices = new ArrayList<>();
+    private ArrayAdapter<String> deviceAdapter;
+    private ArrayAdapter<String> partitionAdapter;
+
+    private Spinner deviceSpinner;
+    private Spinner partitionSpinner;
+    private Spinner actionSpinner;
+    private Spinner vivoModeSpinner;
+    private Button actionButton;
+    private Button flashButton;
+    private Button unlockButton;
+    private Button lockButton;
+    private Button rebootButton;
+    private Button allVarsButton;
+    private Button partitionInfoButton;
+    private Button browseButton;
+    private TextView selectedFileText;
+    private TextView console;
+    private CheckBox rawBox;
+    private CheckBox disableVerityBox;
+    private CheckBox disableVerificationBox;
+
+    private FastbootUsbTransport transport;
+    private Uri selectedFile;
+    private String selectedFileName = "No image selected";
+
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+    private final BroadcastReceiver usbReceiver = new BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) {
+            try {
+                if (ACTION_USB_PERMISSION.equals(intent.getAction())) {
+                    UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+                    boolean granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false);
+                    if (granted && device != null) {
+                        append("USB permission granted: " + label(device));
+                        connectToDevice(device);
+                    } else {
+                        append("USB permission denied.");
+                    }
+                }
+            } catch (Throwable t) {
+                handleThrowable("USB permission receiver", t);
+            }
+        }
+    };
+
+    @Override protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        try {
+            buildUi();
+            CrashHandler.install(this, report -> showCrash(report));
+            String previous = CrashHandler.takeLastReport(this);
+            if (!previous.isEmpty()) showCrash(previous);
+            usbManager = (UsbManager) getSystemService(Context.USB_SERVICE);
+            registerUsbReceiver();
+            refreshUsbDevices();
+        } catch (Throwable t) {
+            handleThrowable("onCreate", t);
+        }
+    }
+
+    @Override protected void onDestroy() {
+        try { unregisterReceiver(usbReceiver); } catch (Throwable ignored) {}
+        disconnect();
+        super.onDestroy();
+    }
+
+    private void buildUi() {
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundResource(com.bintang.vivofastboot.R.color.bg);
+        root.setPadding(dp(16), dp(8), dp(16), dp(16));
+
+        TextView title = new TextView(this);
+        title.setText("Fastboot");
+        title.setTextColor(getColor(R.color.text));
+        title.setTextSize(28);
+        title.setPadding(0, dp(4), 0, dp(10));
+        root.addView(title, matchWrap());
+
+        addLabel(root, "Device");
+        deviceSpinner = new Spinner(this);
+        deviceAdapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, new ArrayList<>());
+        deviceSpinner.setAdapter(deviceAdapter);
+        root.addView(deviceSpinner, matchWrap());
+
+        rebootButton = addButton(root, "Reboot");
+        rebootButton.setOnClickListener(v -> safeAsync("reboot", () -> {
+            requireTransport();
+            transport.execute("reboot");
+            append("Reboot command sent.");
+        }));
+
+        allVarsButton = addButton(root, "All variables list");
+        allVarsButton.setOnClickListener(v -> safeAsync("getvar:all", this::loadAllVariables));
+
+        partitionInfoButton = addButton(root, "Partitions info");
+        partitionInfoButton.setOnClickListener(v -> safeAsync("partitions info", this::showPartitionInfo));
+
+        addLabel(root, "Partition");
+        partitionSpinner = new Spinner(this);
+        partitionAdapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, new ArrayList<>());
+        partitionSpinner.setAdapter(partitionAdapter);
+        root.addView(partitionSpinner, matchWrap());
+
+        LinearLayout opRow = row();
+        actionSpinner = new Spinner(this);
+        ArrayAdapter<String> opAdapter = new ArrayAdapter<>(this,
+                android.R.layout.simple_spinner_dropdown_item,
+                new String[]{"---", "Format", "Erase"});
+        actionSpinner.setAdapter(opAdapter);
+        opRow.addView(actionSpinner, new LinearLayout.LayoutParams(0, dp(58), 1f));
+        actionButton = smallButton("Run");
+        opRow.addView(actionButton, new LinearLayout.LayoutParams(dp(150), dp(58)));
+        root.addView(opRow);
+        actionButton.setOnClickListener(v -> safeAsync("partition action", this::runPartitionAction));
+
+        addLabel(root, "Flasher");
+        LinearLayout fileRow = row();
+        selectedFileText = new TextView(this);
+        selectedFileText.setText(selectedFileName);
+        selectedFileText.setTextColor(getColor(R.color.text));
+        selectedFileText.setGravity(Gravity.CENTER_VERTICAL);
+        selectedFileText.setSingleLine(true);
+        fileRow.addView(selectedFileText, new LinearLayout.LayoutParams(0, dp(58), 1f));
+        browseButton = smallButton("Browse...");
+        fileRow.addView(browseButton, new LinearLayout.LayoutParams(dp(140), dp(58)));
+        root.addView(fileRow);
+        browseButton.setOnClickListener(v -> openFilePicker());
+
+        LinearLayout options = row();
+        rawBox = check("raw");
+        disableVerityBox = check("disable-verity");
+        disableVerificationBox = check("disable-verification");
+        options.addView(rawBox, new LinearLayout.LayoutParams(0, dp(52), 1f));
+        options.addView(disableVerityBox, new LinearLayout.LayoutParams(0, dp(52), 1f));
+        options.addView(disableVerificationBox, new LinearLayout.LayoutParams(0, dp(52), 1f));
+        root.addView(options);
+
+        flashButton = addButton(root, "Flash");
+        flashButton.setOnClickListener(v -> safeAsync("flash", this::flashSelectedFile));
+
+        addLabel(root, "Vivo bootloader protocol");
+        vivoModeSpinner = new Spinner(this);
+        ArrayAdapter<String> vivoAdapter = new ArrayAdapter<>(this,
+                android.R.layout.simple_spinner_dropdown_item,
+                new String[]{"New Vivo (vivo_bsp)", "Old Vivo (bbk)", "Generic fastboot"});
+        vivoModeSpinner.setAdapter(vivoAdapter);
+        root.addView(vivoModeSpinner, matchWrap());
+
+        LinearLayout unlockRow = row();
+        unlockButton = smallButton("Unlock");
+        lockButton = smallButton("Lock");
+        unlockRow.addView(unlockButton, new LinearLayout.LayoutParams(0, dp(60), 1f));
+        unlockRow.addView(lockButton, new LinearLayout.LayoutParams(0, dp(60), 1f));
+        root.addView(unlockRow);
+        unlockButton.setOnClickListener(v -> confirmBootloaderAction(false));
+        lockButton.setOnClickListener(v -> confirmBootloaderAction(true));
+
+        addLabel(root, "Output");
+        console = new TextView(this);
+        console.setTextColor(getColor(R.color.text));
+        console.setTextSize(13);
+        console.setTypeface(android.graphics.Typeface.MONOSPACE);
+        console.setPadding(dp(10), dp(10), dp(10), dp(10));
+        console.setBackgroundColor(getColor(R.color.panel2));
+        ScrollView outputScroll = new ScrollView(this);
+        outputScroll.setFillViewport(true);
+        outputScroll.addView(console, new ScrollView.LayoutParams(-1, dp(220)));
+        root.addView(outputScroll, new LinearLayout.LayoutParams(-1, 0, 1f));
+
+        setContentView(root);
+        append("VivoFastboot 0.1.0 ready.");
+        append("Use a USB-OTG connection to the target phone in fastboot mode.");
+    }
+
+    private void registerUsbReceiver() {
+        IntentFilter filter = new IntentFilter(ACTION_USB_PERMISSION);
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(usbReceiver, filter, Context.RECEIVER_EXPORTED);
+        } else {
+            registerReceiver(usbReceiver, filter);
+        }
+    }
+
+    private void refreshUsbDevices() {
+        usbDevices.clear();
+        deviceAdapter.clear();
+        if (usbManager == null) return;
+        Map<String, UsbDevice> map = usbManager.getDeviceList();
+        for (UsbDevice device : map.values()) {
+            usbDevices.add(device);
+            deviceAdapter.add(label(device));
+        }
+        deviceAdapter.notifyDataSetChanged();
+
+        if (usbDevices.isEmpty()) {
+            deviceAdapter.add("No USB devices detected");
+            deviceAdapter.notifyDataSetChanged();
+            append("No USB devices currently connected.");
+            return;
+        }
+
+        deviceSpinner.setSelection(0);
+        UsbDevice selected = usbDevices.get(0);
+        append("Detected USB: " + label(selected));
+        requestPermission(selected);
+    }
+
+    private String label(UsbDevice d) {
+        String name = d.getProductName();
+        if (name == null || name.trim().isEmpty()) name = "USB device";
+        return String.format(Locale.US, "%s  VID:%04X PID:%04X", name,
+                d.getVendorId(), d.getProductId());
+    }
+
+    private void requestPermission(UsbDevice device) {
+        try {
+            if (usbManager.hasPermission(device)) {
+                connectToDevice(device);
+                return;
+            }
+            Intent intent = new Intent(ACTION_USB_PERMISSION).setPackage(getPackageName());
+            PendingIntent pi;
+            if (Build.VERSION.SDK_INT >= 31) {
+                pi = PendingIntent.getBroadcast(this, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+            } else {
+                pi = PendingIntent.getBroadcast(this, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT);
+            }
+            usbManager.requestPermission(device, pi);
+        } catch (Throwable t) {
+            handleThrowable("USB permission request", t);
+        }
+    }
+
+    private void connectToDevice(UsbDevice device) {
+        safeAsync("connect", () -> {
+            disconnect();
+            UsbDeviceConnection conn = usbManager.openDevice(device);
+            if (conn == null) throw new FastbootException("openDevice() returned null");
+            transport = FastbootUsbTransport.open(device, conn, this::append);
+            append("Connected to " + label(device));
+            loadQuickInfo();
+            loadPartitionNames();
+        });
+    }
+
+    private void disconnect() {
+        if (transport != null) {
+            try { transport.close(); } catch (Throwable ignored) {}
+            transport = null;
+        }
+    }
+
+    private void requireTransport() throws FastbootException {
+        if (transport == null) throw new FastbootException("No fastboot device connected");
+    }
+
+    private void loadQuickInfo() throws FastbootException {
+        String[] vars = {
+                "product", "version-bootloader", "unlocked", "current-slot",
+                "slot-count", "max-download-size", "secure"
+        };
+        for (String v : vars) {
+            try {
+                String value = transport.exchangeText("getvar:" + v);
+                append(String.format(Locale.US, "%s = %s", v, value));
+            } catch (FastbootException e) {
+                append("getvar:" + v + " -> " + e.getMessage());
+            }
+        }
+    }
+
+    private void loadPartitionNames() throws FastbootException {
+        FastbootUsbTransport.Response r = transport.execute("getvar:all");
+        LinkedHashSet<String> names = new LinkedHashSet<>();
+        for (String s : r.info) {
+            String line = s;
+            int idx = line.indexOf("partition-size:");
+            if (idx >= 0) {
+                String n = line.substring(idx + "partition-size:".length());
+                int colon = n.indexOf(':');
+                if (colon > 0) n = n.substring(0, colon);
+                if (!n.isEmpty()) names.add(n);
+            }
+            idx = line.indexOf("partition-type:");
+            if (idx >= 0) {
+                String n = line.substring(idx + "partition-type:".length());
+                int colon = n.indexOf(':');
+                if (colon > 0) n = n.substring(0, colon);
+                if (!n.isEmpty()) names.add(n);
+            }
+        }
+
+        if (names.isEmpty()) {
+            Collections.addAll(names, "boot", "init_boot", "vbmeta", "system", "vendor", "product", "recovery", "userdata");
+        }
+        final ArrayList<String> list = new ArrayList<>(names);
+        mainHandler.post(() -> {
+            partitionAdapter.clear();
+            partitionAdapter.addAll(list);
+            partitionAdapter.notifyDataSetChanged();
+        });
+        append("Partitions loaded: " + list.size());
+    }
+
+    private void loadAllVariables() throws FastbootException {
+        requireTransport();
+        FastbootUsbTransport.Response r = transport.execute("getvar:all");
+        append("=== getvar:all ===");
+        for (String line : r.info) append(line);
+        append("=== end ===");
+    }
+
+    private void showPartitionInfo() throws FastbootException {
+        requireTransport();
+        String p = selectedPartition();
+        String type = "";
+        String size = "";
+        try { type = transport.exchangeText("getvar:partition-type:" + p); } catch (FastbootException e) { type = e.getMessage(); }
+        try { size = transport.exchangeText("getvar:partition-size:" + p); } catch (FastbootException e) { size = e.getMessage(); }
+        append("Partition: " + p);
+        append("type: " + type);
+        append("size: " + size);
+    }
+
+    private void runPartitionAction() throws FastbootException {
+        requireTransport();
+        String p = selectedPartition();
+        int pos = actionSpinner.getSelectedItemPosition();
+        if (pos == 0) {
+            append("Choose Format or Erase first.");
+            return;
+        }
+        if (pos == 1) {
+            confirmAndRun("Format " + p + "?", () -> {
+                try {
+                    FastbootUsbTransport.Response r = transport.execute("format:" + p);
+                    append("format:" + p + " -> " + r.status + " " + r.message);
+                } catch (FastbootException e) {
+                    append("Format unsupported/failed: " + e.getMessage());
+                }
+            });
+        } else {
+            confirmAndRun("Erase " + p + "? This removes the partition contents.", () -> {
+                try {
+                    FastbootUsbTransport.Response r = transport.execute("erase:" + p);
+                    append("erase:" + p + " -> " + r.status + " " + r.message);
+                } catch (FastbootException e) {
+                    append("Erase failed: " + e.getMessage());
+                }
+            });
+        }
+    }
+
+    private String selectedPartition() throws FastbootException {
+        Object o = partitionSpinner.getSelectedItem();
+        if (o == null) throw new FastbootException("No partition selected");
+        String p = o.toString().trim();
+        if (p.isEmpty() || "No partitions".equals(p)) throw new FastbootException("No partition selected");
+        return p;
+    }
+
+    private void flashSelectedFile() throws Exception {
+        requireTransport();
+        if (selectedFile == null) throw new FastbootException("Select an image first");
+        String partition = selectedPartition();
+        long max = getMaxDownloadSize();
+
+        long size = queryFileSize(selectedFile);
+        if (size < 0) throw new FastbootException("Could not determine file size from the selected document provider");
+        if (size > max) throw new FastbootException(String.format(Locale.US,
+                "Image is %d bytes but target max-download-size is %d bytes", size, max));
+
+        append(String.format(Locale.US, "Image: %s (%d bytes)%s", selectedFileName, size, rawBox.isChecked() ? " [raw]" : ""));
+
+        boolean patchFlags = (disableVerityBox.isChecked() || disableVerificationBox.isChecked()) &&
+                (partition.equals("vbmeta") || partition.equals("vbmeta_a") || partition.equals("vbmeta_b"));
+
+        if (patchFlags) {
+            try (InputStream in = getContentResolver().openInputStream(selectedFile)) {
+                if (in == null) throw new FastbootException("Unable to open selected file");
+                byte[] data = AvbUtils.readAll(in, max);
+                AvbUtils.patchDisableFlags(data, disableVerityBox.isChecked(), disableVerificationBox.isChecked());
+                append("AVB flags patched; flashing modified vbmeta buffer.");
+                final long[] last = { -1 };
+                FastbootUsbTransport.Response r = transport.downloadAndFlash(partition, data, (done, total) -> {
+                    long pct = total == 0 ? 100 : (done * 100 / total);
+                    if (pct != last[0]) {
+                        last[0] = pct;
+                        mainHandler.post(() -> setStatusLine("Flashing " + pct + "%..."));
+                    }
+                });
+                append("flash:" + partition + " -> " + r.status + " " + r.message);
+            }
+        } else {
+            if (disableVerityBox.isChecked() || disableVerificationBox.isChecked()) {
+                append("disable-verity/verification is only patched automatically for vbmeta/vbmeta_a/vbmeta_b.");
+            }
+            try (InputStream in = getContentResolver().openInputStream(selectedFile)) {
+                if (in == null) throw new FastbootException("Unable to open selected file");
+                final long[] last = { -1 };
+                transport.download(in, size, (done, total) -> {
+                    long pct = total == 0 ? 100 : (done * 100 / total);
+                    if (pct != last[0]) {
+                        last[0] = pct;
+                        mainHandler.post(() -> setStatusLine("Downloading " + pct + "%..."));
+                    }
+                });
+                FastbootUsbTransport.Response r = transport.execute("flash:" + partition);
+                append("flash:" + partition + " -> " + r.status + " " + r.message);
+            }
+        }
+        setStatusLine("Ready");
+    }
+
+    private long queryFileSize(Uri uri) {
+        try (android.database.Cursor c = getContentResolver().query(uri,
+                new String[]{android.provider.OpenableColumns.SIZE}, null, null, null)) {
+            if (c != null && c.moveToFirst() && !c.isNull(0)) return c.getLong(0);
+        } catch (Throwable ignored) {}
+        try (android.os.ParcelFileDescriptor pfd = getContentResolver().openFileDescriptor(uri, "r")) {
+            if (pfd != null) {
+                long size = pfd.getStatSize();
+                return size >= 0 ? size : -1;
+            }
+        } catch (Throwable ignored) {}
+        return -1;
+    }
+
+    private long getMaxDownloadSize() {
+        try {
+            String v = transport.exchangeText("getvar:max-download-size");
+            String s = v.toLowerCase(Locale.US).trim();
+            long mult = 1;
+            if (s.endsWith("g")) { mult = 1024L * 1024L * 1024L; s = s.substring(0, s.length() - 1); }
+            else if (s.endsWith("m")) { mult = 1024L * 1024L; s = s.substring(0, s.length() - 1); }
+            else if (s.endsWith("k")) { mult = 1024L; s = s.substring(0, s.length() - 1); }
+            else if (s.startsWith("0x")) return Long.parseLong(s.substring(2), 16);
+            return Long.parseLong(s) * mult;
+        } catch (Throwable ignored) {
+            return 512L * 1024L * 1024L;
+        }
+    }
+
+    private void confirmBootloaderAction(boolean lock) {
+        String title = lock ? "Lock bootloader" : "Unlock bootloader";
+        String body = lock
+                ? "This sends the selected Vivo/generic lock command. A mismatched command can be rejected by the bootloader."
+                : "Bootloader unlocking can erase user data and may be refused by the device."
+                ;
+        new AlertDialog.Builder(this)
+                .setTitle(title)
+                .setMessage(body)
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Continue", (d, w) -> safeAsync(title, () -> doBootloaderAction(lock)))
+                .show();
+    }
+
+    private void doBootloaderAction(boolean lock) throws FastbootException {
+        requireTransport();
+        int mode = vivoModeSpinner.getSelectedItemPosition();
+        String command;
+        if (mode == 0) command = "vivo_bsp " + (lock ? "lock_vivo" : "unlock_vivo");
+        else if (mode == 1) command = "bbk " + (lock ? "lock_vivo" : "unlock_vivo");
+        else command = lock ? "flashing lock" : "flashing unlock";
+
+        append("Sending: " + command);
+        FastbootUsbTransport.Response r = transport.execute(command);
+        append("Result: " + r.status + " " + r.message);
+    }
+
+    private void confirmAndRun(String message, Runnable task) {
+        new AlertDialog.Builder(this)
+                .setTitle("Confirm")
+                .setMessage(message)
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Continue", (d, w) -> mainHandler.post(task))
+                .show();
+    }
+
+    private void openFilePicker() {
+        try {
+            Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            i.addCategory(Intent.CATEGORY_OPENABLE);
+            i.setType("*/*");
+            startActivityForResult(i, PICK_FILE);
+        } catch (Throwable t) {
+            handleThrowable("file picker", t);
+        }
+    }
+
+    @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != PICK_FILE || resultCode != RESULT_OK || data == null || data.getData() == null) return;
+        try {
+            selectedFile = data.getData();
+            selectedFileName = selectedFile.getLastPathSegment();
+            if (selectedFileName == null) selectedFileName = selectedFile.toString();
+            selectedFileText.setText(selectedFileName);
+            append("Selected file: " + selectedFile);
+        } catch (Throwable t) {
+            handleThrowable("file selection", t);
+        }
+    }
+
+    private void safeAsync(String name, CheckedTask task) {
+        setBusy(true, name + "...");
+        new Thread(() -> {
+            try {
+                task.run();
+            } catch (Throwable t) {
+                handleThrowable(name, t);
+            } finally {
+                mainHandler.post(() -> setBusy(false, "Ready"));
+            }
+        }, "vf-" + name.replace(' ', '-')).start();
+    }
+
+    private void setBusy(boolean busy, String status) {
+        mainHandler.post(() -> {
+            rebootButton.setEnabled(!busy);
+            allVarsButton.setEnabled(!busy);
+            partitionInfoButton.setEnabled(!busy);
+            actionButton.setEnabled(!busy);
+            browseButton.setEnabled(!busy);
+            flashButton.setEnabled(!busy);
+            unlockButton.setEnabled(!busy);
+            lockButton.setEnabled(!busy);
+            setStatusLine(status);
+        });
+    }
+
+    private void setStatusLine(String status) {
+        // Keep the last output line rather than adding a second status widget.
+        // This method is intentionally lightweight for frequent flash progress updates.
+        if (console != null) {
+            console.setTag(status);
+        }
+    }
+
+    private void append(String line) {
+        mainHandler.post(() -> {
+            if (console == null) return;
+            String old = console.getText() == null ? "" : console.getText().toString();
+            String now = old.isEmpty() ? line : old + "\n" + line;
+            if (now.length() > 30000) now = now.substring(now.length() - 30000);
+            console.setText(now);
+            console.post(() -> ((android.widget.ScrollView) console.getParent()).fullScroll(View.FOCUS_DOWN));
+        });
+    }
+
+    private void showCrash(String report) {
+        append(report);
+        Toast.makeText(this, "Crash captured in Output", Toast.LENGTH_LONG).show();
+    }
+
+    private void handleThrowable(String context, Throwable t) {
+        String msg = t.getMessage();
+        if (msg == null || msg.trim().isEmpty()) msg = t.getClass().getSimpleName();
+        append("[ERROR] " + context + ": " + msg);
+        append("App kept open; see Output for the error.");
+    }
+
+    private interface CheckedTask { void run() throws Exception; }
+
+    private LinearLayout.LayoutParams matchWrap() {
+        return new LinearLayout.LayoutParams(-1, -2);
+    }
+
+    private LinearLayout row() {
+        LinearLayout r = new LinearLayout(this);
+        r.setOrientation(LinearLayout.HORIZONTAL);
+        r.setGravity(Gravity.CENTER_VERTICAL);
+        r.setPadding(0, dp(4), 0, dp(4));
+        return r;
+    }
+
+    private void addLabel(LinearLayout root, String text) {
+        TextView label = new TextView(this);
+        label.setText(text);
+        label.setTextColor(getColor(R.color.muted));
+        label.setTextSize(14);
+        label.setPadding(dp(4), dp(8), 0, dp(3));
+        root.addView(label, matchWrap());
+    }
+
+    private Button addButton(LinearLayout root, String text) {
+        Button b = new Button(this);
+        styleButton(b, text);
+        root.addView(b, new LinearLayout.LayoutParams(-1, dp(58)));
+        return b;
+    }
+
+    private Button smallButton(String text) {
+        Button b = new Button(this);
+        styleButton(b, text);
+        return b;
+    }
+
+    private void styleButton(Button b, String text) {
+        b.setText(text);
+        b.setTextColor(getColor(R.color.text));
+        b.setTextSize(16);
+        b.setAllCaps(false);
+        b.setBackgroundColor(getColor(R.color.panel));
+    }
+
+    private CheckBox check(String text) {
+        CheckBox cb = new CheckBox(this);
+        cb.setText(text);
+        cb.setTextColor(getColor(R.color.muted));
+        cb.setTextSize(12);
+        return cb;
+    }
+
+    private int dp(int v) {
+        return Math.round(v * getResources().getDisplayMetrics().density);
+    }
+}

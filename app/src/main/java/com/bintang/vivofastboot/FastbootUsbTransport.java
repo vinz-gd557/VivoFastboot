@@ -1,0 +1,260 @@
+package com.bintang.vivofastboot;
+
+import android.hardware.usb.UsbConstants;
+import android.hardware.usb.UsbDevice;
+import android.hardware.usb.UsbDeviceConnection;
+import android.hardware.usb.UsbEndpoint;
+import android.hardware.usb.UsbInterface;
+
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+
+/**
+ * Minimal Android USB-host implementation of the classic fastboot protocol.
+ * It deliberately does not use /dev/bus/usb, libusb, or Runtime.exec().
+ */
+public final class FastbootUsbTransport {
+    public interface Logger {
+        void log(String line);
+    }
+
+    public interface Progress {
+        void onProgress(long done, long total);
+    }
+
+    public static final class Response {
+        public final String status;
+        public final String message;
+        public final List<String> info;
+
+        Response(String status, String message, List<String> info) {
+            this.status = status;
+            this.message = message;
+            this.info = info;
+        }
+
+        public boolean isOkay() {
+            return "OKAY".equals(status);
+        }
+    }
+
+    private static final int IO_TIMEOUT_MS = 10000;
+    private static final int RESPONSE_TIMEOUT_MS = 120000;
+    private static final int COMMAND_MAX = 64;
+    private static final int RESPONSE_BUFFER = 64;
+    private static final int DATA_CHUNK = 64 * 1024;
+
+    private final UsbDevice device;
+    private final UsbDeviceConnection connection;
+    private final UsbInterface intf;
+    private final UsbEndpoint in;
+    private final UsbEndpoint out;
+    private final Logger logger;
+    private volatile boolean closed;
+
+    private FastbootUsbTransport(UsbDevice device,
+                                 UsbDeviceConnection connection,
+                                 UsbInterface intf,
+                                 UsbEndpoint in,
+                                 UsbEndpoint out,
+                                 Logger logger) {
+        this.device = device;
+        this.connection = connection;
+        this.intf = intf;
+        this.in = in;
+        this.out = out;
+        this.logger = logger;
+    }
+
+    public static FastbootUsbTransport open(UsbDevice device,
+                                            UsbDeviceConnection connection,
+                                            Logger logger) throws FastbootException {
+        if (device == null || connection == null) {
+            throw new FastbootException("USB device/connection is null");
+        }
+
+        for (int i = 0; i < device.getInterfaceCount(); i++) {
+            UsbInterface candidate = device.getInterface(i);
+            UsbEndpoint candidateIn = null;
+            UsbEndpoint candidateOut = null;
+
+            for (int e = 0; e < candidate.getEndpointCount(); e++) {
+                UsbEndpoint ep = candidate.getEndpoint(e);
+                if (ep.getType() != UsbConstants.USB_ENDPOINT_XFER_BULK) continue;
+                if (ep.getDirection() == UsbConstants.USB_DIR_IN && candidateIn == null) {
+                    candidateIn = ep;
+                } else if (ep.getDirection() == UsbConstants.USB_DIR_OUT && candidateOut == null) {
+                    candidateOut = ep;
+                }
+            }
+
+            if (candidateIn != null && candidateOut != null) {
+                if (!connection.claimInterface(candidate, true)) {
+                    continue;
+                }
+                if (logger != null) {
+                    logger.log("USB interface " + i + " claimed; bulk transport ready.");
+                }
+                return new FastbootUsbTransport(device, connection, candidate, candidateIn, candidateOut, logger);
+            }
+        }
+
+        try { connection.close(); } catch (Throwable ignored) {}
+        throw new FastbootException("No bulk IN/OUT interface found. Device may not be in fastboot mode.");
+    }
+
+    public UsbDevice getDevice() {
+        return device;
+    }
+
+    public String exchangeText(String command) throws FastbootException {
+        Response r = execute(command);
+        if (!r.isOkay()) {
+            throw new FastbootException(r.status + " " + r.message);
+        }
+        return r.message == null ? "" : r.message;
+    }
+
+    public Response execute(String command) throws FastbootException {
+        ensureOpen();
+        if (command == null || command.length() == 0) {
+            throw new FastbootException("Empty fastboot command");
+        }
+        byte[] cmd = command.getBytes(StandardCharsets.US_ASCII);
+        if (cmd.length > COMMAND_MAX) {
+            throw new FastbootException("Command exceeds 64-byte fastboot limit");
+        }
+        writeFully(cmd);
+        return readTerminalResponse();
+    }
+
+    public Response download(byte[] data, Progress progress) throws FastbootException {
+        if (data == null) throw new FastbootException("No image data");
+        return download(new java.io.ByteArrayInputStream(data), data.length, progress);
+    }
+
+    public Response download(java.io.InputStream input, long size, Progress progress) throws FastbootException {
+        ensureOpen();
+        if (input == null) throw new FastbootException("No image stream");
+        if (size < 0 || size > 0xFFFFFFFFL) throw new FastbootException("Invalid image size: " + size);
+
+        String command = String.format(Locale.US, "download:%08x", size);
+        writeFully(command.getBytes(StandardCharsets.US_ASCII));
+
+        String ack = readSinglePacket(RESPONSE_TIMEOUT_MS);
+        if (ack.length() < 12 || !ack.startsWith("DATA")) {
+            if (ack.startsWith("FAIL")) throw new FastbootException(ack.substring(4));
+            throw new FastbootException("Unexpected download response: " + ack);
+        }
+
+        long accepted;
+        try { accepted = Long.parseLong(ack.substring(4, 12), 16); }
+        catch (NumberFormatException e) { throw new FastbootException("Malformed DATA response: " + ack, e); }
+        if (accepted != size) {
+            throw new FastbootException(String.format(Locale.US,
+                    "Target accepted %d bytes but %d were requested", accepted, size));
+        }
+
+        byte[] buffer = new byte[DATA_CHUNK];
+        long sentTotal = 0;
+        try {
+            while (sentTotal < size) {
+                int wanted = (int)Math.min(buffer.length, size - sentTotal);
+                int read = 0;
+                while (read < wanted) {
+                    int n = input.read(buffer, read, wanted - read);
+                    if (n < 0) throw new FastbootException("Image stream ended early at " + sentTotal + " bytes");
+                    if (n == 0) continue;
+                    read += n;
+                }
+
+                int off = 0;
+                while (off < read) {
+                    int n = connection.bulkTransfer(out, buffer, off, read - off, IO_TIMEOUT_MS);
+                    if (n <= 0) throw new FastbootException("USB write failed while downloading image (" + n + ")");
+                    off += n;
+                }
+                sentTotal += read;
+                if (progress != null) progress.onProgress(sentTotal, size);
+            }
+        } catch (java.io.IOException e) {
+            throw new FastbootException("Failed reading image", e);
+        }
+
+        Response r = readTerminalResponse();
+        if (!r.isOkay()) throw new FastbootException(r.status + " " + r.message);
+        return r;
+    }
+
+    public Response downloadAndFlash(String partition,
+                                     byte[] data,
+                                     Progress progress) throws FastbootException {
+        if (partition == null || partition.trim().isEmpty()) {
+            throw new FastbootException("Partition is empty");
+        }
+        download(data, progress);
+        Response flash = execute("flash:" + partition.trim());
+        if (!flash.isOkay()) {
+            throw new FastbootException(flash.status + " " + flash.message);
+        }
+        return flash;
+    }
+
+    public void close() {
+        closed = true;
+        try { connection.releaseInterface(intf); } catch (Throwable ignored) {}
+        try { connection.close(); } catch (Throwable ignored) {}
+    }
+
+    private void ensureOpen() throws FastbootException {
+        if (closed) throw new FastbootException("USB transport is closed");
+    }
+
+    private void writeFully(byte[] data) throws FastbootException {
+        int off = 0;
+        while (off < data.length) {
+            int sent = connection.bulkTransfer(out, data, off, data.length - off, IO_TIMEOUT_MS);
+            if (sent <= 0) throw new FastbootException("USB command write failed (" + sent + ")");
+            off += sent;
+        }
+    }
+
+    private String readSinglePacket(int timeoutMs) throws FastbootException {
+        byte[] buf = new byte[RESPONSE_BUFFER];
+        int n = connection.bulkTransfer(in, buf, 0, buf.length, timeoutMs);
+        if (n <= 0) throw new FastbootException("USB response read failed/timeout (" + n + ")");
+        return new String(buf, 0, n, StandardCharsets.US_ASCII).trim();
+    }
+
+    private Response readTerminalResponse() throws FastbootException {
+        ArrayList<String> info = new ArrayList<>();
+        while (true) {
+            String packet = readSinglePacket(RESPONSE_TIMEOUT_MS);
+            Response r = decode(packet, info);
+            if ("INFO".equals(r.status)) {
+                continue;
+            }
+            return r;
+        }
+    }
+
+    private Response decode(String packet, List<String> info) throws FastbootException {
+        if (packet == null || packet.length() < 4) {
+            throw new FastbootException("Malformed fastboot response");
+        }
+        String status = packet.substring(0, 4);
+        String message = packet.length() > 4 ? packet.substring(4) : "";
+        if ("INFO".equals(status)) {
+            info.add(message);
+            if (logger != null) logger.log("INFO " + message);
+            return new Response(status, message, info);
+        }
+        if (!"OKAY".equals(status) && !"FAIL".equals(status) && !"DATA".equals(status)) {
+            throw new FastbootException("Unknown fastboot status: " + status);
+        }
+        if ("FAIL".equals(status) && logger != null) logger.log("FAIL " + message);
+        return new Response(status, message, info);
+    }
+}
