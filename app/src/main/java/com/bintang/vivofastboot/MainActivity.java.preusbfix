@@ -77,25 +77,11 @@ public class MainActivity extends Activity {
                 if (ACTION_USB_PERMISSION.equals(intent.getAction())) {
                     UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
                     boolean granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false);
-                    if (device == null) {
-                        append("[USB] Permission callback tanpa device.");
-                        return;
-                    }
-
-                    boolean realPermission =
-                            granted || usbManager.hasPermission(device);
-
-                    append("USB permission callback: granted="
-                            + granted
-                            + " hasPermission="
-                            + usbManager.hasPermission(device));
-
-                    if (realPermission) {
-                        append("USB permission OK: " + label(device));
+                    if (granted && device != null) {
+                        append("USB permission granted: " + label(device));
                         connectToDevice(device);
                     } else {
-                        append("USB permission DENIED by Android/ROM.");
-                        append("Cabut USB, masuk fastboot lagi, lalu sambungkan ulang.");
+                        append("USB permission denied.");
                     }
                 }
             } catch (Throwable t) {
@@ -237,92 +223,35 @@ public class MainActivity extends Activity {
 
     private void registerUsbReceiver() {
         IntentFilter filter = new IntentFilter(ACTION_USB_PERMISSION);
-
         if (Build.VERSION.SDK_INT >= 33) {
-            registerReceiver(
-                    usbReceiver,
-                    filter,
-                    Context.RECEIVER_EXPORTED
-            );
+            registerReceiver(usbReceiver, filter, Context.RECEIVER_EXPORTED);
         } else {
-            registerReceiver(
-                    usbReceiver,
-                    filter
-            );
+            registerReceiver(usbReceiver, filter);
         }
     }
 
     private void refreshUsbDevices() {
-        try {
-            usbDevices.clear();
-            deviceAdapter.clear();
-
-            if (usbManager == null) {
-                append("[USB] UsbManager unavailable.");
-                return;
-            }
-
-            Map<String, UsbDevice> map = usbManager.getDeviceList();
-
-            for (UsbDevice device : map.values()) {
-                usbDevices.add(device);
-                deviceAdapter.add(label(device));
-            }
-
-            if (usbDevices.isEmpty()) {
-                deviceAdapter.add("No USB devices detected");
-                deviceAdapter.notifyDataSetChanged();
-                append("[USB] No USB devices currently connected.");
-                return;
-            }
-
-            deviceAdapter.notifyDataSetChanged();
-
-            deviceSpinner.setSelection(0);
-
-            if (deviceSpinner.getTag() == null) {
-                deviceSpinner.setTag(Boolean.TRUE);
-
-                deviceSpinner.setOnItemSelectedListener(
-                        new android.widget.AdapterView.OnItemSelectedListener() {
-                            @Override
-                            public void onItemSelected(
-                                    android.widget.AdapterView<?> parent,
-                                    View view,
-                                    int position,
-                                    long id) {
-
-                                if (position < 0 || position >= usbDevices.size()) {
-                                    return;
-                                }
-
-                                UsbDevice selected = usbDevices.get(position);
-
-                                append(
-                                        "[USB] Selected: "
-                                                + label(selected)
-                                );
-
-                                requestPermission(selected);
-                            }
-
-                            @Override
-                            public void onNothingSelected(
-                                    android.widget.AdapterView<?> parent) {
-                            }
-                        }
-                );
-            }
-
-            UsbDevice selected = usbDevices.get(0);
-
-            append("[USB] Detected: " + label(selected));
-
-            requestPermission(selected);
-
-        } catch (Throwable t) {
-            handleThrowable("refresh USB devices", t);
+        usbDevices.clear();
+        deviceAdapter.clear();
+        if (usbManager == null) return;
+        Map<String, UsbDevice> map = usbManager.getDeviceList();
+        for (UsbDevice device : map.values()) {
+            usbDevices.add(device);
+            deviceAdapter.add(label(device));
         }
+        deviceAdapter.notifyDataSetChanged();
+
+        if (usbDevices.isEmpty()) {
+            deviceAdapter.add("No USB devices detected");
+            deviceAdapter.notifyDataSetChanged();
+            append("No USB devices currently connected.");
+            return;
+        }
+
+        deviceSpinner.setSelection(0);
+        UsbDevice selected = usbDevices.get(0);
+        append("Detected USB: " + label(selected));
+        requestPermission(selected);
     }
 
     private String label(UsbDevice d) {
@@ -334,48 +263,18 @@ public class MainActivity extends Activity {
 
     private void requestPermission(UsbDevice device) {
         try {
-            if (device == null) {
-                append("[USB] Device null.");
-                return;
-            }
-
-            if (usbManager == null) {
-                append("[USB] UsbManager belum tersedia.");
-                return;
-            }
-
-            append(String.format(
-                    Locale.US,
-                    "[USB] Checking permission VID:%04X PID:%04X",
-                    device.getVendorId(),
-                    device.getProductId()));
-
             if (usbManager.hasPermission(device)) {
-                append("[USB] Permission already granted.");
                 connectToDevice(device);
                 return;
             }
-
-            Intent intent = new Intent(ACTION_USB_PERMISSION);
-            intent.setPackage(getPackageName());
-
-            int flags = PendingIntent.FLAG_UPDATE_CURRENT;
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                flags |= PendingIntent.FLAG_MUTABLE;
+            Intent intent = new Intent(ACTION_USB_PERMISSION).setPackage(getPackageName());
+            PendingIntent pi;
+            if (Build.VERSION.SDK_INT >= 31) {
+                pi = PendingIntent.getBroadcast(this, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+            } else {
+                pi = PendingIntent.getBroadcast(this, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT);
             }
-
-            int requestCode = 1000 + Math.max(0, device.getDeviceId());
-
-            PendingIntent pi = PendingIntent.getBroadcast(
-                    this,
-                    requestCode,
-                    intent,
-                    flags);
-
-            append("[USB] Requesting permission...");
             usbManager.requestPermission(device, pi);
-
         } catch (Throwable t) {
             handleThrowable("USB permission request", t);
         }
@@ -383,57 +282,13 @@ public class MainActivity extends Activity {
 
     private void connectToDevice(UsbDevice device) {
         safeAsync("connect", () -> {
-            if (device == null) {
-                throw new FastbootException("USB device is null");
-            }
-
-            if (usbManager == null) {
-                throw new FastbootException("UsbManager is null");
-            }
-
-            if (!usbManager.hasPermission(device)) {
-                append("[USB] No permission yet; requesting again.");
-                requestPermission(device);
-                throw new FastbootException(
-                        "USB permission belum diberikan.");
-            }
-
-            append("[USB] Opening device: " + label(device));
-
             disconnect();
-
             UsbDeviceConnection conn = usbManager.openDevice(device);
-
-            if (conn == null) {
-                throw new FastbootException(
-                        "openDevice() returned null. " +
-                        "Android memberi device, tetapi USB interface tidak bisa dibuka.");
-            }
-
-            append("[USB] openDevice() OK.");
-
-            try {
-                transport = FastbootUsbTransport.open(
-                        device,
-                        conn,
-                        this::append);
-
-                append("[USB] Fastboot transport connected.");
-                append("[USB] Loading device information...");
-
-                loadQuickInfo();
-                loadPartitionNames();
-
-                append("[OK] Device ready.");
-
-            } catch (Throwable t) {
-                try {
-                    conn.close();
-                } catch (Throwable ignored) {
-                }
-
-                throw t;
-            }
+            if (conn == null) throw new FastbootException("openDevice() returned null");
+            transport = FastbootUsbTransport.open(device, conn, this::append);
+            append("Connected to " + label(device));
+            loadQuickInfo();
+            loadPartitionNames();
         });
     }
 
@@ -445,11 +300,7 @@ public class MainActivity extends Activity {
     }
 
     private void requireTransport() throws FastbootException {
-        if (transport == null) {
-            throw new FastbootException(
-                    "No fastboot transport. " +
-                    "Pastikan USB permission sudah OK dan device tersambung.");
-        }
+        if (transport == null) throw new FastbootException("No fastboot device connected");
     }
 
     private void loadQuickInfo() throws FastbootException {
@@ -655,51 +506,15 @@ public class MainActivity extends Activity {
 
     private void doBootloaderAction(boolean lock) throws FastbootException {
         requireTransport();
-
         int mode = vivoModeSpinner.getSelectedItemPosition();
-
         String command;
+        if (mode == 0) command = "vivo_bsp " + (lock ? "lock_vivo" : "unlock_vivo");
+        else if (mode == 1) command = "bbk " + (lock ? "lock_vivo" : "unlock_vivo");
+        else command = lock ? "flashing lock" : "flashing unlock";
 
-        if (mode == 0) {
-            command = "vivo_bsp " + (lock ? "lock_vivo" : "unlock_vivo");
-        } else if (mode == 1) {
-            command = "bbk " + (lock ? "lock_vivo" : "unlock_vivo");
-        } else {
-            command = lock ? "flashing lock" : "flashing unlock";
-        }
-
-        append("=== Bootloader action ===");
-        append("Protocol: " +
-                vivoModeSpinner.getSelectedItem().toString());
-        append("Command: " + command);
-        append("Sending...");
-
+        append("Sending: " + command);
         FastbootUsbTransport.Response r = transport.execute(command);
-
-        append("Status: " + r.status);
-        append("Message: " +
-                (r.message == null ? "" : r.message));
-
-        if (r.info != null) {
-            for (String line : r.info) {
-                if (line != null && !line.trim().isEmpty()) {
-                    append("INFO: " + line);
-                }
-            }
-        }
-
-        if (!r.isOkay()) {
-            append("[FAIL] Bootloader rejected the command.");
-            append("[FAIL] Device/firmware may not support this protocol.");
-            return;
-        }
-
-        append("[OK] Command accepted by bootloader.");
-
-        if (!lock) {
-            append("Unlock command accepted; check the phone screen");
-            append("for any confirmation or reboot/data-wipe behavior.");
-        }
+        append("Result: " + r.status + " " + r.message);
     }
 
     private void confirmAndRun(String message, Runnable task) {
